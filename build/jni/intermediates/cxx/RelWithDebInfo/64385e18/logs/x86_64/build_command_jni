@@ -1,4 +1,0 @@
-/home/kilwish/Android/Sdk/cmake/3.22.1/bin/ninja \
-  -C \
-  /home/kilwish/.pub-cache/hosted/pub.dev/jni-1.0.3/android/.cxx/RelWithDebInfo/64385e18/x86_64 \
-  jni
