@@ -1,0 +1,7 @@
+Analyzing application_approval.dart...
+
+warning - application_approval.dart:1468:46 - Dead code. Try removing the code, or fixing the code before it so that it can be reached. - dead_code
+warning - application_approval.dart:1471:46 - Dead code. Try removing the code, or fixing the code before it so that it can be reached. - dead_code
+warning - application_approval.dart:1724:13 - The value of the local variable 'approveRejectValue' isn't used. Try removing the variable or using it. - unused_local_variable
+
+3 issues found.

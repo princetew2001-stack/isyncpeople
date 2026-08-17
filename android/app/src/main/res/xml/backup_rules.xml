@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Exclude SharedPreferences from backup -->
+    <!-- This ensures login credentials and session data are NOT backed up -->
+    <exclude domain="sharedpref" path="FlutterSharedPreferences.xml"/>
+    
+    <!-- Exclude all shared preferences to be safe -->
+    <exclude domain="sharedpref" path="."/>
+    
+    <!-- Exclude database files if any -->
+    <exclude domain="database" path="."/>
+    
+    <!-- Exclude cache -->
+    <exclude domain="file" path="cache/."/>
+</full-backup-content>

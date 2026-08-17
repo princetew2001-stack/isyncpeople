@@ -1,0 +1,2 @@
+/home/kilwish/projects/CI Application/build/.cxx/release/5sj54501/armeabi-v7a/CMakeFiles/edit_cache.dir
+/home/kilwish/projects/CI Application/build/.cxx/release/5sj54501/armeabi-v7a/CMakeFiles/rebuild_cache.dir

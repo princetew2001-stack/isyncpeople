@@ -1,0 +1,65 @@
+-- Merging decision tree log ---
+manifest
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:1:1-26:12
+INJECTED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:1:1-26:12
+	package
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:2:5-50
+		INJECTED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml
+	xmlns:android
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:1:11-69
+uses-permission#android.permission.FOREGROUND_SERVICE
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:4:5-77
+	android:name
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:4:22-74
+uses-permission#android.permission.WAKE_LOCK
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:5:5-68
+	android:name
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:5:22-65
+uses-permission#android.permission.RECEIVE_BOOT_COMPLETED
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:6:5-81
+	android:name
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:6:22-78
+uses-permission#android.permission.POST_NOTIFICATIONS
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:7:5-77
+	android:name
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:7:22-74
+application
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:9:5-25:19
+receiver#com.pravera.flutter_foreground_task.service.RebootReceiver
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:10:9-20:20
+	android:enabled
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:12:13-35
+	android:exported
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:13:13-36
+	android:name
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:11:13-51
+intent-filter#action:name:android.intent.action.BOOT_COMPLETED+action:name:android.intent.action.MY_PACKAGE_REPLACED+action:name:android.intent.action.QUICKBOOT_POWERON
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:14:13-19:29
+action#android.intent.action.BOOT_COMPLETED
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:15:17-79
+	android:name
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:15:25-76
+action#android.intent.action.MY_PACKAGE_REPLACED
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:16:17-84
+	android:name
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:16:25-81
+action#android.intent.action.QUICKBOOT_POWERON
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:18:17-82
+	android:name
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:18:25-79
+receiver#com.pravera.flutter_foreground_task.service.RestartReceiver
+ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:21:9-24:40
+	android:enabled
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:23:13-35
+	android:exported
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:24:13-37
+	android:name
+		ADDED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml:22:13-52
+uses-sdk
+INJECTED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml
+INJECTED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from /home/kilwish/.pub-cache/hosted/pub.dev/flutter_foreground_task-8.17.0/android/src/main/AndroidManifest.xml
