@@ -1,0 +1,2037 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'dart:async';
+import '../utils/app_localizations.dart';
+import '../utils/location_service.dart';
+import '../utils/notification_service.dart';
+
+class ClockingPage extends StatefulWidget {
+  const ClockingPage({super.key});
+
+  @override
+  State<ClockingPage> createState() => _ClockingPageState();
+}
+
+class _ClockingPageState extends State<ClockingPage> with TickerProviderStateMixin {
+  bool isCheckedIn = false;
+  DateTime? checkInTime;
+  DateTime? checkOutTime;
+  String? checkInLocation;
+  String? checkOutLocation;
+  String? checkInCoordinates;
+  String? checkOutCoordinates;
+  Timer? _timer;
+  Timer? _workTimer;
+  DateTime currentTime = DateTime.now();
+  String currentLocation = "Fetching location...";
+  bool isLocationLoading = true;
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
+  
+  // Work timer variables
+  Duration workDuration = Duration.zero;       // current session elapsed (ticking while clocked in)
+  Duration totalWorkedDuration = Duration.zero; // sum of all completed sessions today
+  bool canClockOut = false;
+  bool isDayCompleted = false; // Both punch in and out completed
+
+  // Post clock-in cooldown (2 minutes) before clock-out button is enabled
+  Timer? _cooldownTimer;
+  int _cooldownSecondsLeft = 0; // 0 means no cooldown active
+  
+  // Business rules for clock in/out restrictions
+  bool _hasEverClockedOut = false; // If user has clocked out once, no more clock in allowed
+  bool _isEarlyCheckout = false; // If user checked out before 7 PM (19:00)
+  
+  // API Configuration
+  static const String _punchingApiUrl = 'https://delton.intellisync.in:11004/payroll/punching/create/';
+  String? _loggedInUsername;
+  String? _loggedInUserId;
+  
+  // Guard flag to prevent duplicate punch submissions
+  bool _isProcessingClocking = false;
+  DateTime? _lastClockingAttempt;
+  
+  // Additional duplicate prevention with unique operation IDs
+  String? _currentOperationId;
+  static const Duration _minimumClockingInterval = Duration(seconds: 5);
+  static const Duration _duplicateCheckWindow = Duration(seconds: 45);
+
+  @override
+  void initState() {
+    super.initState();
+    _startTimer();
+    _getCurrentLocation();
+    _initializeAnimations();
+    _cleanupStaleAttempts(); // Clean up any stale punch attempts from crashes
+    _loadClockingState();
+    _startMidnightResetTimer();
+    _loadLoggedInUserData();
+  }
+  
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _workTimer?.cancel();
+    _cooldownTimer?.cancel();
+    _pulseController.dispose();
+    super.dispose();
+  }
+  
+  void _initializeAnimations() {
+    _pulseController = AnimationController(
+      duration: const Duration(seconds: 2),
+      vsync: this,
+    );
+    _pulseAnimation = Tween<double>(
+      begin: 1.0,
+      end: 1.05, // Reduced animation range for better performance
+    ).animate(CurvedAnimation(
+      parent: _pulseController,
+      curve: Curves.easeInOut,
+    ));
+    // Only animate when checked in to reduce unnecessary animations
+    if (isCheckedIn) {
+      _pulseController.repeat(reverse: true);
+    }
+  }
+  
+  void _startTimer() {
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (mounted) {
+        final newTime = DateTime.now();
+        // Only update if the time has actually changed (avoid unnecessary rebuilds)
+        if (newTime.second != currentTime.second) {
+          setState(() {
+            currentTime = newTime;
+          });
+        }
+      }
+    });
+  }
+  
+  void _getCurrentLocation() async {
+    setState(() {
+      isLocationLoading = true;
+      currentLocation = "Fetching location...";
+    });
+
+    try {
+      String location = await LocationService.getCurrentLocation();
+      if (mounted) {
+        setState(() {
+          currentLocation = location;
+          isLocationLoading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          currentLocation = "Unable to get location";
+          isLocationLoading = false;
+        });
+      }
+    }
+  }
+
+  void _startWorkTimer() {
+    _workTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (mounted) {
+        setState(() {
+          // Current session elapsed = now - checkInTime
+          // Total displayed = previous sessions + current session
+          if (checkInTime != null) {
+            final currentSession = DateTime.now().difference(checkInTime!);
+            workDuration = totalWorkedDuration + currentSession;
+          } else {
+            workDuration = totalWorkedDuration + Duration(seconds: workDuration.inSeconds - totalWorkedDuration.inSeconds + 1);
+          }
+          // Clock out is controlled by cooldown timer, not minimum duration
+        });
+
+        // Save work duration every 10 seconds to avoid too frequent writes
+        if (workDuration.inSeconds % 10 == 0) {
+          _saveClockingState();
+        }
+      }
+    });
+  }
+
+  void _stopWorkTimer() {
+    _workTimer?.cancel();
+    setState(() {
+      // Freeze workDuration at the moment of clock-out; it now becomes the
+      // total worked time displayed until the user clocks in again.
+      totalWorkedDuration = workDuration;
+      canClockOut = false;
+    });
+  }
+
+  void _startCooldownTimer() {
+    _cooldownTimer?.cancel();
+    setState(() => _cooldownSecondsLeft = 120); // 2 minutes = 120 seconds
+    _cooldownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      setState(() {
+        _cooldownSecondsLeft--;
+        if (_cooldownSecondsLeft <= 0) {
+          _cooldownSecondsLeft = 0;
+          timer.cancel();
+          
+          // After cooldown, if user is clocked in, enable clock out
+          if (isCheckedIn) {
+            canClockOut = true; // Enable clock out button
+            debugPrint('🔓 Clock out enabled after 2 minute cooldown');
+          }
+        }
+      });
+    });
+  }
+
+  /// Check if current time is before 7 PM (19:00)
+  bool _isBeforeEveningCutoff([DateTime? timeToCheck]) {
+    final checkTime = timeToCheck ?? DateTime.now();
+    final eveningCutoff = DateTime(checkTime.year, checkTime.month, checkTime.day, 19, 0); // 7 PM
+    return checkTime.isBefore(eveningCutoff);
+  }
+
+  /// Check if current time is after 7 PM (19:00)  
+  bool _isAfterEveningCutoff([DateTime? timeToCheck]) {
+    final checkTime = timeToCheck ?? DateTime.now();
+    final eveningCutoff = DateTime(checkTime.year, checkTime.month, checkTime.day, 19, 0); // 7 PM
+    return checkTime.isAfter(eveningCutoff);
+  }
+
+  String _formatDuration(Duration duration) {
+    String twoDigits(int n) => n.toString().padLeft(2, '0');
+    String hours = twoDigits(duration.inHours);
+    String minutes = twoDigits(duration.inMinutes.remainder(60));
+    String seconds = twoDigits(duration.inSeconds.remainder(60));
+    return '$hours:$minutes:$seconds';
+  }
+
+  Future<void> _loadClockingState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      
+      // Check if it's a new day and reset if needed
+      await _checkAndResetForNewDay();
+      
+      // Debug: Check what API data we have
+      debugPrint('🔍 API Data Check:');
+      debugPrint('🔍 punch_in_data: ${prefs.getString('punch_in_data')}');
+      debugPrint('🔍 punch_out_data: ${prefs.getString('punch_out_data')}');
+      
+      // First check for punch data from API (takes priority)
+      final punchInDataStr = prefs.getString('punch_in_data');
+      final punchOutDataStr = prefs.getString('punch_out_data');
+      
+      bool foundApiPunchData = false;
+      bool hasPunchIn = false;
+      bool hasPunchOut = false;
+      
+      // Check punch in data from API
+      if (punchInDataStr != null && punchInDataStr.isNotEmpty) {
+        try {
+          final punchInData = jsonDecode(punchInDataStr) as Map<String, dynamic>;
+          debugPrint('🔍 Punch In Data from API: $punchInData');
+          
+          if (punchInData.containsKey('punch_time')) {
+            final punchTimeStr = punchInData['punch_time']?.toString();
+            final punchLoc = punchInData['punch_loc']?.toString();
+            
+            debugPrint('🔍 Punch In Time: $punchTimeStr, Location: $punchLoc');
+            
+            if (punchTimeStr != null) {
+              final punchDateTime = _parseApiDateTime(punchTimeStr);
+              final currentDateTime = DateTime.now();
+              
+              // Check if punch in is from today
+              if (_isSameDay(punchDateTime, currentDateTime)) {
+                // Restore previously accumulated total (from earlier sessions today)
+                final savedTotalWorked = prefs.getInt('total_worked_duration') ?? 0;
+                final previousTotal = Duration(seconds: savedTotalWorked);
+                final currentSession = currentDateTime.difference(punchDateTime);
+                final totalNow = previousTotal + currentSession;
+
+                setState(() {
+                  isCheckedIn = true;
+                  checkInTime = punchDateTime;
+                  checkInLocation = punchLoc ?? 'Location not available';
+                  totalWorkedDuration = previousTotal;
+                  workDuration = totalNow;
+                  canClockOut = true; // Enable clock out for existing sessions
+                });
+                
+                hasPunchIn = true;
+                foundApiPunchData = true;
+                debugPrint('📱 Loaded punch in data from API for clocking page');
+                
+                // Start work timer if clocked in
+                _startWorkTimer();
+                _pulseController.repeat(reverse: true);
+              }
+            }
+          }
+        } catch (e) {
+          debugPrint('❌ Error parsing punch in data: $e');
+        }
+      } else {
+        debugPrint('⚠️ No punch in data found in API response');
+      }
+      
+      // Check punch out data from API
+      if (punchOutDataStr != null && punchOutDataStr.isNotEmpty) {
+        try {
+          final punchOutData = jsonDecode(punchOutDataStr) as Map<String, dynamic>;
+          debugPrint('🔍 Punch Out Data from API: $punchOutData');
+          
+          if (punchOutData.containsKey('punch_time')) {
+            final punchTimeStr = punchOutData['punch_time']?.toString();
+            final punchLoc = punchOutData['punch_loc']?.toString();
+            
+            debugPrint('🔍 Punch Out Time: $punchTimeStr, Location: $punchLoc');
+            
+            if (punchTimeStr != null) {
+              final punchDateTime = _parseApiDateTime(punchTimeStr);
+              final currentDateTime = DateTime.now();
+              
+              // Check if punch out is from today
+              if (_isSameDay(punchDateTime, currentDateTime)) {
+                final isEarlyCheckout = _isBeforeEveningCutoff(punchDateTime);
+                
+                setState(() {
+                  checkOutTime = punchDateTime;
+                  checkOutLocation = punchLoc ?? 'Location not available';
+                  _hasEverClockedOut = true; // Mark that user has clocked out
+                  _isEarlyCheckout = isEarlyCheckout; // Check if early checkout
+                  isDayCompleted = true; // Day is complete after punch out
+                });
+                
+                hasPunchOut = true;
+                foundApiPunchData = true;
+                debugPrint('📱 Loaded punch out data from API - Early checkout: $isEarlyCheckout');
+              }
+            }
+          }
+        } catch (e) {
+          debugPrint('❌ Error parsing punch out data: $e');
+        }
+      } else {
+        debugPrint('⚠️ No punch out data found in API response');
+      }
+      
+      // If both punch in and punch out data exist, user has completed the day
+      if (hasPunchIn && hasPunchOut) {
+        // Check if checkout was before 7 PM using the already parsed checkOutTime
+        final isEarlyCheckout = _isBeforeEveningCutoff(checkOutTime!);
+        
+        // Compute worked time from the two API timestamps
+        final workedSoFar = checkOutTime!.difference(checkInTime!);
+        setState(() {
+          isCheckedIn = false;
+          canClockOut = false;
+          isDayCompleted = true;
+          _hasEverClockedOut = true; // Mark that user has clocked out
+          _isEarlyCheckout = isEarlyCheckout; // Mark if it was early checkout
+          totalWorkedDuration = workedSoFar;
+          workDuration = workedSoFar;
+        });
+        _workTimer?.cancel();
+        _pulseController.stop();
+        debugPrint('📱 User has completed punch in and out for today - Early checkout: $isEarlyCheckout');
+      } else if (hasPunchOut && !hasPunchIn) {
+        // Only punch out exists - day is complete, no clock in allowed
+        setState(() {
+          isCheckedIn = false;
+          canClockOut = false;
+          isDayCompleted = true;
+          _hasEverClockedOut = true;
+          // _isEarlyCheckout is already set above when parsing punch out data
+        });
+        _workTimer?.cancel();
+        _pulseController.stop();
+        debugPrint('📱 Only punch out data found - Day complete, no clock in allowed');
+      }
+      
+      // If API punch data was found, give it priority over local data
+      if (foundApiPunchData) {
+        debugPrint('📱 Using API punch data, skipping local data checks');
+      } else {
+        // If no API punch data found, fall back to local data
+        final isCurrentlyCheckedIn = prefs.getBool('is_currently_clocked_in') ?? false;
+        final checkInTimeStr = prefs.getString('current_check_in_time');
+        final checkInLoc = prefs.getString('current_check_in_location');
+        final checkInCoord = prefs.getString('current_check_in_coordinates');
+        
+        // Restore previously accumulated total worked duration
+        final savedTotalWorked = prefs.getInt('total_worked_duration') ?? 0;
+        
+        // Load business rule flags
+        final hasEverClockedOut = prefs.getBool('has_ever_clocked_out') ?? false;
+        final isEarlyCheckout = prefs.getBool('is_early_checkout') ?? false;
+        final isDayComplete = prefs.getBool('is_day_completed') ?? false;
+        
+        // Load today's check out data if available
+        final checkOutTimeStr = prefs.getString('today_check_out_time');
+        final checkOutLoc = prefs.getString('today_check_out_location');
+        final checkOutCoord = prefs.getString('today_check_out_coordinates');
+        
+        bool hasLocalCheckOut = false;
+        if (checkOutTimeStr != null) {
+          final checkOutDateTime = DateTime.parse(checkOutTimeStr);
+          final currentDateTime = DateTime.now();
+          
+          debugPrint('🔍 Local Checkout Time: $checkOutTimeStr');
+          debugPrint('🔍 Current Date: ${DateFormat('yyyy-MM-dd').format(currentDateTime)}');
+          debugPrint('🔍 Checkout Date: ${DateFormat('yyyy-MM-dd').format(checkOutDateTime)}');
+          
+          // Check if checkout is from today
+          if (_isSameDay(checkOutDateTime, currentDateTime)) {
+            final isEarlyCheckout = _isBeforeEveningCutoff(checkOutDateTime);
+            
+            setState(() {
+              checkOutTime = checkOutDateTime;
+              checkOutLocation = checkOutLoc;
+              checkOutCoordinates = checkOutCoord;
+              _hasEverClockedOut = true;
+              _isEarlyCheckout = isEarlyCheckout;
+              isDayCompleted = true;
+            });
+            hasLocalCheckOut = true;
+            debugPrint('📱 Found local checkout data - Early checkout: $isEarlyCheckout');
+          } else {
+            debugPrint('🗑️ Local checkout data is from different day, ignoring');
+          }
+        }
+        
+        // If user has checked out, don't allow any more actions
+        if (hasLocalCheckOut || hasEverClockedOut) {
+          setState(() {
+            isCheckedIn = false;
+            canClockOut = false;
+            _hasEverClockedOut = hasEverClockedOut;
+            _isEarlyCheckout = isEarlyCheckout;
+            isDayCompleted = isDayComplete;
+          });
+          debugPrint('📱 User has already checked out today - Day complete');
+          return;
+        }
+        
+        if (isCurrentlyCheckedIn && checkInTimeStr != null) {
+          final checkInDateTime = DateTime.parse(checkInTimeStr);
+          final currentDateTime = DateTime.now();
+          
+          // Check if check in time is from today
+          if (_isSameDay(checkInDateTime, currentDateTime)) {
+            final previousTotal = Duration(seconds: savedTotalWorked);
+            final currentSession = currentDateTime.difference(checkInDateTime);
+            final totalNow = previousTotal + currentSession;
+            
+            setState(() {
+              isCheckedIn = true;
+              checkInTime = checkInDateTime;
+              checkInLocation = checkInLoc;
+              checkInCoordinates = checkInCoord;
+              totalWorkedDuration = previousTotal;
+              workDuration = totalNow;
+              canClockOut = true; // Enable clock out if loading existing session
+            });
+            
+            // Start work timer if clocked in
+            _startWorkTimer();
+            _pulseController.repeat(reverse: true);
+          } else {
+            // Check in time is from previous day, reset state
+            await _resetDailyData();
+          }
+        } else if (savedTotalWorked > 0) {
+          // Clocked out — restore the frozen total to display it
+          setState(() {
+            totalWorkedDuration = Duration(seconds: savedTotalWorked);
+            workDuration = Duration(seconds: savedTotalWorked);
+          });
+        }
+        
+        debugPrint('📱 Loaded local clocking data');
+      } // End of foundApiPunchData else block
+    } catch (e) {
+      debugPrint('Error loading clocking state: $e');
+    }
+  }
+      }
+    } catch (e) {
+      debugPrint('Error loading clocking state: $e');
+    }
+  }
+
+  Future<void> _checkAndResetForNewDay() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final lastResetDateStr = prefs.getString('last_reset_date');
+      final currentDate = DateTime.now();
+      final currentDateStr = DateFormat('yyyy-MM-dd').format(currentDate);
+      
+      if (lastResetDateStr != currentDateStr) {
+        // It's a new day, reset all daily data
+        await _resetDailyData();
+        await prefs.setString('last_reset_date', currentDateStr);
+      }
+    } catch (e) {
+      debugPrint('Error checking daily reset: $e');
+    }
+  }
+
+  Future<void> _resetDailyData() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      
+      // Clear all daily clocking data
+      await prefs.remove('is_currently_clocked_in');
+      await prefs.remove('current_check_in_time');
+      await prefs.remove('current_check_in_location');
+      await prefs.remove('current_check_in_coordinates');
+      await prefs.remove('current_work_duration');
+      await prefs.remove('today_check_out_time');
+      await prefs.remove('today_check_out_location');
+      await prefs.remove('today_check_out_coordinates');
+      await prefs.remove('total_worked_duration');
+      // Clear business rule flags
+      await prefs.remove('has_ever_clocked_out');
+      await prefs.remove('is_early_checkout');
+      await prefs.remove('is_day_completed');
+      
+      // Reset state variables
+      setState(() {
+        isCheckedIn = false;
+        checkInTime = null;
+        checkOutTime = null;
+        checkInLocation = null;
+        checkOutLocation = null;
+        checkInCoordinates = null;
+        checkOutCoordinates = null;
+        workDuration = Duration.zero;
+        totalWorkedDuration = Duration.zero;
+        canClockOut = false;
+        // Reset business rule flags for new day
+        _hasEverClockedOut = false;
+        _isEarlyCheckout = false;
+        isDayCompleted = false;
+        _cooldownSecondsLeft = 0;
+      });
+      
+      // Stop timers and animations
+      _stopWorkTimer();
+      _pulseController.stop();
+      _pulseController.reset();
+      
+      debugPrint('Daily data reset completed');
+    } catch (e) {
+      debugPrint('Error resetting daily data: $e');
+    }
+  }
+
+  bool _isSameDay(DateTime date1, DateTime date2) {
+    return date1.year == date2.year &&
+           date1.month == date2.month &&
+           date1.day == date2.day;
+  }
+
+  /// Parse API datetime string that comes in IST format (e.g., "2025-12-29T13:32:09+05:30")
+  /// and convert it to local DateTime
+  DateTime _parseApiDateTime(String dateTimeStr) {
+    try {
+      // Parse the datetime string with timezone info
+      final parsedDateTime = DateTime.parse(dateTimeStr);
+      
+      // If the parsed datetime is in UTC, convert to local
+      if (parsedDateTime.isUtc) {
+        return parsedDateTime.toLocal();
+      }
+      
+      // If it has timezone offset, DateTime.parse handles it correctly
+      return parsedDateTime;
+    } catch (e) {
+      debugPrint('❌ Error parsing datetime: $dateTimeStr, error: $e');
+      // Fallback to current time if parsing fails
+      return DateTime.now();
+    }
+  }
+
+  void _startMidnightResetTimer() {
+    // Calculate time until next midnight
+    final now = DateTime.now();
+    final nextMidnight = DateTime(now.year, now.month, now.day + 1);
+    final timeUntilMidnight = nextMidnight.difference(now);
+    
+    // Set timer for midnight reset
+    Timer(timeUntilMidnight, () {
+      _resetDailyData();
+      // Start daily timer for subsequent days
+      Timer.periodic(const Duration(days: 1), (timer) {
+        if (mounted) {
+          _resetDailyData();
+        } else {
+          timer.cancel();
+        }
+      });
+    });
+  }
+
+  Future<void> _loadLoggedInUserData() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _loggedInUsername = prefs.getString('user_email'); // This was saved during login
+      _loggedInUserId = prefs.getString('user_id'); // This was saved during login
+      debugPrint('📱 Loaded username: $_loggedInUsername');
+      debugPrint('📱 Loaded user ID: $_loggedInUserId');
+    } catch (e) {
+      debugPrint('❌ Error loading username: $e');
+    }
+  }
+
+  /// Clean up stale punch attempt records that might be left from app crashes
+  Future<void> _cleanupStaleAttempts() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final keys = prefs.getKeys();
+      final now = DateTime.now();
+      int cleanedCount = 0;
+      
+      // Find and clean stale attempt records (older than 10 minutes)
+      for (final key in keys) {
+        if (key.startsWith('punch_attempt_')) {
+          try {
+            final attemptData = prefs.getString(key);
+            if (attemptData != null) {
+              final attempt = jsonDecode(attemptData);
+              final attemptTime = DateTime.parse(attempt['timestamp']);
+              
+              // Remove attempts older than 10 minutes (they're definitely stale)
+              if (now.difference(attemptTime).inMinutes > 10) {
+                await prefs.remove(key);
+                cleanedCount++;
+                debugPrint('🧹 Cleaned stale attempt: $key (${now.difference(attemptTime).inMinutes} minutes old)');
+              }
+            }
+          } catch (e) {
+            // If we can't parse it, remove it
+            await prefs.remove(key);
+            cleanedCount++;
+            debugPrint('🧹 Cleaned invalid attempt record: $key');
+          }
+        }
+      }
+      
+      if (cleanedCount > 0) {
+        debugPrint('🧹 Cleanup complete: removed $cleanedCount stale attempt records');
+      }
+    } catch (e) {
+      debugPrint('⚠️ Error during cleanup: $e');
+    }
+  }
+
+  Future<bool> _testPunchingServerConnectivity() async {
+    try {
+      debugPrint('🔍 Testing punching server connectivity...');
+      final response = await http.get(
+        Uri.parse('https://delton.intellisync.in:11004'),
+        headers: {'Accept': 'text/html,application/json'},
+      ).timeout(const Duration(seconds: 5));
+      
+      debugPrint('🌐 Punching server reachable - Status: ${response.statusCode}');
+      return response.statusCode < 500; // Server is reachable
+    } catch (e) {
+      debugPrint('🚫 Punching server unreachable: $e');
+      return false;
+    }
+  }
+
+  Future<Map<String, dynamic>> _punchingAPI(String type, String location, String operationId) async {
+    // Use user ID if available, otherwise fall back to username
+    String? userIdentifier = _loggedInUserId ?? _loggedInUsername;
+    
+    if (userIdentifier == null) {
+      throw Exception('User ID/Username not found. Please login again.');
+    }
+
+    final currentDateTime = DateTime.now();
+    final formattedDateTime = DateFormat('yyyy-MM-dd HH:mm:ss').format(currentDateTime);
+    
+    // Generate a comprehensive unique request ID to help prevent server-side duplicates
+    final requestId = '${userIdentifier}_${type}_${currentDateTime.millisecondsSinceEpoch}_${operationId}';
+    
+    debugPrint('🔗 Attempting punching API: $_punchingApiUrl');
+    debugPrint('🆔 Using ${_loggedInUserId != null ? "User ID" : "Username"}: $userIdentifier');
+    debugPrint('🎯 Request ID: $requestId (OpID: $operationId)');
+    debugPrint('📤 Punching payload: {"username": "$userIdentifier", "type": "$type", "location": "$location", "time": "$formattedDateTime", "request_id": "$requestId", "operation_id": "$operationId"}');
+    debugPrint('💡 Note: "username" field contains ${_loggedInUserId != null ? "User ID" : "Username"} value');
+    
+    // Test server connectivity first
+    final isServerReachable = await _testPunchingServerConnectivity();
+    if (!isServerReachable) {
+      throw Exception('Punching server is not reachable at delton.intellisync.in:11004');
+    }
+    
+    try {
+      debugPrint('🚀 Sending POST request to punching API...');
+      final response = await http.post(
+        Uri.parse(_punchingApiUrl),
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-Request-ID': requestId, // Add request ID to headers for server-side deduplication
+          'X-Operation-ID': operationId, // Add operation ID for enhanced tracking
+          'X-Client-Timestamp': currentDateTime.millisecondsSinceEpoch.toString(),
+        },
+        body: jsonEncode({
+          'username': userIdentifier, // This will be user ID if available, otherwise username
+          'type': type,
+          'location': location,
+          'time': formattedDateTime,
+          'request_id': requestId, // Add request ID to body as well
+          'operation_id': operationId, // Add operation ID to body for server-side deduplication
+          'client_timestamp': currentDateTime.millisecondsSinceEpoch,
+        }),
+      ).timeout(
+        const Duration(seconds: 15),
+        onTimeout: () {
+          debugPrint('⏰ Punching API timeout after 15 seconds');
+          throw Exception('Connection timeout - Server is not responding');
+        },
+      );
+
+      debugPrint('✅ Punching API Response received');
+      debugPrint('📊 Status Code: ${response.statusCode}');
+      debugPrint('📋 Response Headers: ${response.headers}');
+      debugPrint('📄 Response Body: ${response.body}');
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        try {
+          final Map<String, dynamic> responseData = jsonDecode(response.body);
+          
+          // Check for success indicators
+          bool isSuccess = false;
+          if (responseData.containsKey('success')) {
+            isSuccess = responseData['success'] == true;
+          } else if (responseData.containsKey('status')) {
+            final status = responseData['status'];
+            isSuccess = status == true || status == 'success' || status == 'ok';
+          } else {
+            // Assume success for 200/201 status codes
+            isSuccess = true;
+          }
+          
+          debugPrint('🔍 Punching success check: isSuccess=$isSuccess');
+          
+          if (isSuccess) {
+            return {
+              'success': true,
+              'data': responseData,
+              'request_id': requestId,
+            };
+          } else {
+            return {
+              'success': false,
+              'error': responseData['message'] ?? responseData['error'] ?? 'Punching failed',
+              'request_id': requestId,
+            };
+          }
+        } catch (jsonError) {
+          debugPrint('❌ JSON parsing error: $jsonError');
+          return {
+            'success': false,
+            'error': 'Invalid server response format',
+            'request_id': requestId,
+          };
+        }
+      } else if (response.statusCode == 409) {
+        // Handle potential duplicate detection from server
+        debugPrint('⚠️ Server detected duplicate request (409)');
+        return {
+          'success': false,
+          'error': 'Duplicate punch detected. Please wait before trying again.',
+          'request_id': requestId,
+        };
+      } else if (response.statusCode == 302) {
+        // Handle redirect
+        final location = response.headers['location'];
+        debugPrint('🔄 Redirect detected to: $location');
+        return {
+          'success': false,
+          'error': 'API endpoint redirected. Please check the correct URL.',
+          'request_id': requestId,
+        };
+      } else if (response.statusCode == 404) {
+        debugPrint('❌ API endpoint not found (404)');
+        return {
+          'success': false,
+          'error': 'Punching API endpoint not found. Please verify the URL.',
+          'request_id': requestId,
+        };
+      } else if (response.statusCode == 405) {
+        debugPrint('❌ Method not allowed (405) - POST might not be supported');
+        return {
+          'success': false,
+          'error': 'POST method not allowed on this endpoint.',
+          'request_id': requestId,
+        };
+      } else {
+        debugPrint('❌ Punching API error: ${response.statusCode}');
+        return {
+          'success': false,
+          'error': 'Server error (${response.statusCode})',
+          'request_id': requestId,
+        };
+      }
+    } catch (e) {
+      debugPrint('❌ Punching API Exception: $e');
+      throw Exception('Network error: ${e.toString()}');
+    }
+  }
+
+  Future<void> _saveClockingState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('is_currently_clocked_in', isCheckedIn);
+      // Always persist totalWorkedDuration so it survives app restarts
+      await prefs.setInt('total_worked_duration', totalWorkedDuration.inSeconds);
+      
+      // Save business rule flags
+      await prefs.setBool('has_ever_clocked_out', _hasEverClockedOut);
+      await prefs.setBool('is_early_checkout', _isEarlyCheckout);
+      await prefs.setBool('is_day_completed', isDayCompleted);
+      
+      if (isCheckedIn && checkInTime != null) {
+        await prefs.setString('current_check_in_time', checkInTime!.toIso8601String());
+        await prefs.setString('current_check_in_location', checkInLocation ?? '');
+        await prefs.setString('current_check_in_coordinates', checkInCoordinates ?? '');
+        await prefs.setInt('current_work_duration', workDuration.inSeconds);
+      } else {
+        // When clocked out, save today's check out data but clear current clocking state
+        if (checkOutTime != null) {
+          await prefs.setString('today_check_out_time', checkOutTime!.toIso8601String());
+          await prefs.setString('today_check_out_location', checkOutLocation ?? '');
+          await prefs.setString('today_check_out_coordinates', checkOutCoordinates ?? '');
+        }
+        
+        // Clear current clocking state
+        await prefs.remove('current_check_in_time');
+        await prefs.remove('current_check_in_location');
+        await prefs.remove('current_check_in_coordinates');
+        await prefs.remove('current_work_duration');
+      }
+    } catch (e) {
+      debugPrint('Error saving clocking state: $e');
+    }
+  }
+  
+  @override
+  Widget build(BuildContext context) {
+    final timeFormat = DateFormat('HH:mm:ss');
+    final dateFormat = DateFormat('EEE, MMMM dd, yyyy');
+    final theme = Theme.of(context);
+    
+    return Scaffold(
+      backgroundColor: theme.scaffoldBackgroundColor,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        systemOverlayStyle: const SystemUiOverlayStyle(
+          statusBarColor: Colors.transparent,
+          statusBarIconBrightness: Brightness.light,
+        ),
+        flexibleSpace: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              colors: [
+                Color(0xFF4CAF50), // Green
+                Color(0xFF2196F3), // Blue
+              ],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+          ),
+        ),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () => Navigator.pop(context),
+        ),
+        title: Text(
+          AppLocalizations.of(context)?.clocking ?? 'Attendance Clocking',
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 20,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        actions: [
+          Container(
+            margin: const EdgeInsets.only(right: 16),
+            child: const CircleAvatar(
+              backgroundColor: Colors.black54,
+              child: Icon(Icons.person, color: Colors.white, size: 20),
+            ),
+          ),
+        ],
+      ),
+      body: SingleChildScrollView(
+        physics: const BouncingScrollPhysics(), // Better scroll performance
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            children: [
+              // Live Time Display / Work Timer
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [
+                      const Color(0xFFD2691E).withValues(alpha: 0.1),
+                      const Color(0xFFD2691E).withValues(alpha: 0.05),
+                    ],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: const Color(0xFFD2691E).withValues(alpha: 0.2),
+                  ),
+                ),
+                child: Column(
+                  children: [
+                    if (isCheckedIn) ...[
+                      Text(
+                        _formatDuration(workDuration),
+                        style: const TextStyle(
+                          fontSize: 32,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFFD2691E),
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Work Duration',
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: theme.textTheme.bodyMedium?.color,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      if (_cooldownSecondsLeft > 0) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Clock out available in ${_formatCooldownTime()}',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.orange[700],
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ] else if (workDuration > Duration.zero) ...[
+                      // Clocked out but has worked time — show frozen total
+                      Text(
+                        _formatDuration(workDuration),
+                        style: const TextStyle(
+                          fontSize: 32,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFFD2691E),
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Total Worked Today',
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: theme.textTheme.bodyMedium?.color,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ] else ...[
+                      Text(
+                        timeFormat.format(currentTime),
+                        style: const TextStyle(
+                          fontSize: 32,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFFD2691E),
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        dateFormat.format(currentTime),
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: theme.textTheme.bodyMedium?.color,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              
+              const SizedBox(height: 30),
+              
+              // Status Indicator
+              AnimatedBuilder(
+                animation: _pulseAnimation,
+                builder: (context, child) {
+                  return Transform.scale(
+                    scale: isCheckedIn ? _pulseAnimation.value : 1.0,
+                    child: Container(
+                      width: 120,
+                      height: 120,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: theme.cardColor,
+                        border: Border.all(
+                          color: isCheckedIn ? Colors.green : const Color(0xFFD2691E),
+                          width: 4,
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: (isCheckedIn ? Colors.green : const Color(0xFFD2691E))
+                                .withValues(alpha: 0.3),
+                            blurRadius: 20,
+                            spreadRadius: 2,
+                          ),
+                        ],
+                      ),
+                      child: Icon(
+                        isCheckedIn ? Icons.check_circle : Icons.access_time,
+                        size: 50,
+                        color: isCheckedIn ? Colors.green : const Color(0xFFD2691E),
+                      ),
+                    ),
+                  );
+                },
+              ),
+              
+              const SizedBox(height: 20),
+              
+              // Status Text
+              Text(
+                _getStatusText(),
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                  color: _getStatusColor(),
+                ),
+              ),
+              
+              if (isCheckedIn && checkInTime != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Since ${timeFormat.format(checkInTime!)}',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.grey[600],
+                  ),
+                ),
+              ],
+              
+              const SizedBox(height: 40),
+              
+              // Action Button
+              Container(
+                width: double.infinity,
+                height: 56,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  gradient: LinearGradient(
+                    colors: _getButtonGradientColors(),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: ((isDayCompleted && _cooldownSecondsLeft > 0)
+                          ? Colors.grey[300]!
+                          : isCheckedIn 
+                              ? (canClockOut ? Colors.red : Colors.grey)
+                              : const Color(0xFFD2691E))
+                              .withValues(alpha: 0.3),
+                      blurRadius: 8,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: _shouldDisableButton()
+                        ? null 
+                        : () {
+                            // Additional protection: disable further taps immediately
+                            if (!_isProcessingClocking && _currentOperationId == null) {
+                              _handleClocking();
+                            }
+                          },
+                    child: Center(
+                      child: _isProcessingClocking
+                          ? const SizedBox(
+                              width: 24,
+                              height: 24,
+                              child: CircularProgressIndicator(
+                                color: Colors.white,
+                                strokeWidth: 2.5,
+                              ),
+                            )
+                          : Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            _getButtonIcon(),
+                            color: _getButtonTextColor(),
+                            size: 24,
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            _getButtonText(),
+                            style: TextStyle(
+                              color: _getButtonTextColor(),
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              
+              const SizedBox(height: 30),
+              
+              // Live Location Display
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: theme.cardColor,
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.08),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFD2691E).withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: const Icon(
+                            Icons.location_on,
+                            color: Color(0xFFD2691E),
+                            size: 20,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Text(
+                          AppLocalizations.of(context)?.currentLocation ?? 'Current Location',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.black87,
+                          ),
+                        ),
+                        const Spacer(),
+                        if (isLocationLoading)
+                          const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(Color(0xFFD2691E)),
+                            ),
+                          )
+                        else
+                          IconButton(
+                            onPressed: _getCurrentLocation,
+                            icon: const Icon(
+                              Icons.refresh,
+                              color: Color(0xFFD2691E),
+                              size: 20,
+                            ),
+                            tooltip: 'Refresh Location',
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      currentLocation,
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: theme.textTheme.bodyMedium?.color,
+                        height: 1.4,
+                      ),
+                    ),
+                    if (!isLocationLoading && !currentLocation.contains('Unable') && !currentLocation.contains('denied')) ...[
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.gps_fixed,
+                            size: 12,
+                            color: Colors.green[600],
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            'GPS Active',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.green[600],
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              
+              const SizedBox(height: 20),
+              
+              // Check-in/Check-out History
+              if (checkInTime != null || checkOutTime != null) ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: theme.cardColor,
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.08),
+                        blurRadius: 8,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Today\'s Activity',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.black87,
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      
+                      if (checkInTime != null) ...[
+                        _buildActivityItem(
+                          'Punch In',
+                          timeFormat.format(checkInTime!),
+                          checkInLocation ?? currentLocation,
+                          checkInCoordinates,
+                          Icons.login,
+                          Colors.green,
+                        ),
+                      ],
+                      
+                      if (checkOutTime != null) ...[
+                        const SizedBox(height: 12),
+                        _buildActivityItem(
+                          'Punch Out',
+                          timeFormat.format(checkOutTime!),
+                          checkOutLocation ?? currentLocation,
+                          checkOutCoordinates,
+                          Icons.logout,
+                          Colors.red,
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ],
+              
+              const SizedBox(height: 20),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+  
+  void _handleClocking() async {
+    // CRITICAL: Generate unique operation ID immediately to prevent race conditions
+    final operationId = '${DateTime.now().millisecondsSinceEpoch}_${(DateTime.now().microsecond % 1000)}';
+    
+    // Prevent double-tap / duplicate submissions with multiple layers of protection
+    if (_isProcessingClocking) {
+      debugPrint('⚠️ Clocking already in progress (opId: $operationId), ignoring tap');
+      return;
+    }
+
+    // ATOMIC CHECK: Immediately claim this operation to prevent race conditions
+    if (_currentOperationId != null) {
+      debugPrint('⚠️ Another operation in progress ($_currentOperationId), ignoring (opId: $operationId)');
+      return;
+    }
+    
+    _currentOperationId = operationId;
+    
+    try {
+      // Enhanced debounce: prevent rapid successive calls (minimum 5 seconds between attempts)
+      final now = DateTime.now();
+      if (_lastClockingAttempt != null && 
+          now.difference(_lastClockingAttempt!).inSeconds < _minimumClockingInterval.inSeconds) {
+        final remainingTime = _minimumClockingInterval.inSeconds - now.difference(_lastClockingAttempt!).inSeconds;
+        debugPrint('⚠️ Clocking attempt too soon (${now.difference(_lastClockingAttempt!).inSeconds}s), need to wait ${remainingTime}s more (opId: $operationId)');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  const Icon(Icons.warning, color: Colors.white, size: 20),
+                  const SizedBox(width: 12),
+                  Text('Please wait ${remainingTime} more seconds before trying again'),
+                ],
+              ),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 2),
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+          );
+        }
+        return;
+      }
+
+      _lastClockingAttempt = now;
+
+      // PERSISTENT DUPLICATE CHECK: Check SharedPreferences BEFORE setting processing flag
+      final prefs = await SharedPreferences.getInstance();
+      final lastPunchKey = 'last_successful_punch';
+      final lastPunchData = prefs.getString(lastPunchKey);
+      
+      if (lastPunchData != null) {
+        try {
+          final lastPunch = jsonDecode(lastPunchData);
+          final lastTime = DateTime.parse(lastPunch['timestamp']);
+          final lastType = lastPunch['type'];
+          final proposedType = isCheckedIn ? 'out' : 'in';
+          
+          // Check if this would be a duplicate within the check window
+          if (now.difference(lastTime) < _duplicateCheckWindow && lastType == proposedType) {
+            final minutesAgo = now.difference(lastTime).inMinutes;
+            debugPrint('⛔ DUPLICATE PREVENTED: Same action ($proposedType) attempted ${minutesAgo} minutes ago (opId: $operationId)');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Row(
+                    children: [
+                      const Icon(Icons.block, color: Colors.white, size: 20),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text('Duplicate ${proposedType.toUpperCase()} prevented. Last ${proposedType.toUpperCase()} was ${minutesAgo} minutes ago.'),
+                      ),
+                    ],
+                  ),
+                  backgroundColor: Colors.red[700],
+                  duration: const Duration(seconds: 4),
+                  behavior: SnackBarBehavior.floating,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              );
+            }
+            return;
+          }
+        } catch (e) {
+          debugPrint('⚠️ Error parsing last punch data: $e (opId: $operationId)');
+        }
+      }
+
+      // Show spinner immediately so the user knows the tap registered
+      setState(() => _isProcessingClocking = true);
+
+      debugPrint('🚀 Starting clocking operation (opId: $operationId)');
+
+      // If location is still loading give it up to 5 seconds to settle,
+      // otherwise use whatever we already have (or fall back to a live fetch).
+      if (isLocationLoading) {
+        int waited = 0;
+        while (isLocationLoading && waited < 5000) {
+          await Future.delayed(const Duration(milliseconds: 200));
+          waited += 200;
+        }
+      }
+
+      final action = isCheckedIn ? 'CLOCK OUT' : 'CLOCK IN';
+      await _performClocking(action, operationId);
+      
+    } catch (e) {
+      debugPrint('❌ Unexpected error in _handleClocking (opId: $operationId): $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.error, color: Colors.white, size: 20),
+                const SizedBox(width: 12),
+                Text('Unexpected error: ${e.toString()}'),
+              ],
+            ),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+        );
+      }
+    } finally {
+      // Always reset the processing flags, even if an error occurs
+      if (mounted) {
+        setState(() => _isProcessingClocking = false);
+      }
+      _currentOperationId = null;
+      debugPrint('✅ Clocking operation completed (opId: $operationId)');
+    }
+  }
+
+
+
+  Future<void> _performClocking(String action, String operationId) async {
+    debugPrint('📝 Performing clocking: $action (opId: $operationId)');
+    
+    try {
+      // Reuse the location already shown on screen if it's valid — avoids a
+      // second GPS round-trip (which causes the location card to flicker and
+      // adds 5-10 s of delay before the button responds).
+      String location;
+      String? coordinates;
+
+      final existingAddress = currentLocation;
+      final addressIsValid = existingAddress.isNotEmpty &&
+          !existingAddress.contains('Fetching') &&
+          !existingAddress.contains('Unable') &&
+          !existingAddress.contains('denied') &&
+          !existingAddress.contains('disabled');
+
+      if (addressIsValid) {
+        // Good address already on screen — use it directly
+        location = existingAddress;
+        coordinates = null; // coordinates are decorative; omit to avoid stale data
+      } else {
+        // No valid address yet — fetch fresh (rare path)
+        final locationData = await LocationService.getCurrentLocationData();
+        location = locationData['address'] ?? 'Location not available';
+        coordinates = locationData['coordinates'];
+        // Update the UI card as well
+        if (mounted) {
+          setState(() {
+            currentLocation = location;
+            isLocationLoading = false;
+          });
+        }
+      }
+      
+      // Determine API type based on action
+      final apiType = action == 'CLOCK IN' ? 'in' : 'out';
+      
+      // ATOMIC WRITE: Record the attempt BEFORE making API call to prevent server-side race conditions
+      final attemptTime = DateTime.now();
+      final prefs = await SharedPreferences.getInstance();
+      final attemptKey = 'punch_attempt_${operationId}';
+      await prefs.setString(attemptKey, jsonEncode({
+        'timestamp': attemptTime.toIso8601String(),
+        'type': apiType,
+        'action': action,
+        'location': location,
+        'operation_id': operationId,
+      }));
+      
+      debugPrint('📡 Making API call for $action (opId: $operationId)');
+      
+      // Call punching API with operation ID for server-side deduplication
+      final apiResponse = await _punchingAPI(apiType, location, operationId);
+      
+      if (apiResponse['success'] == true) {
+        // API call successful - capture the exact moment and update local state
+        final clockingMoment = DateTime.now();
+        
+        debugPrint('✅ API success for $action (opId: $operationId)');
+        
+        // ATOMIC RECORD: Save successful punch immediately to prevent duplicates
+        final successfulPunchKey = 'last_successful_punch';
+        await prefs.setString(successfulPunchKey, jsonEncode({
+          'timestamp': clockingMoment.toIso8601String(),
+          'type': apiType,
+          'action': action,
+          'location': location,
+          'operation_id': operationId,
+        }));
+        
+        // Also keep the legacy format for backward compatibility
+        await prefs.setString('last_punch_time', clockingMoment.toIso8601String());
+        await prefs.setString('last_punch_type', apiType);
+        
+        // Update local state
+        setState(() {
+          if (action == 'CLOCK IN') {
+            isCheckedIn = true;
+            checkInTime = clockingMoment;
+            checkInLocation = location;
+            checkInCoordinates = coordinates;
+            checkOutTime = null;
+            checkOutLocation = null;
+            checkOutCoordinates = null;
+            workDuration = Duration.zero;
+            canClockOut = false; // Initially disable clock out - enabled after 2 min cooldown
+            isDayCompleted = false;
+          } else {
+            // CLOCK OUT: Check if it's early checkout (before 7 PM)
+            final isEarlyCheckout = _isBeforeEveningCutoff(clockingMoment);
+            
+            isCheckedIn = false;
+            checkOutTime = clockingMoment;
+            checkOutLocation = location;
+            checkOutCoordinates = coordinates;
+            _hasEverClockedOut = true; // Mark that user has clocked out
+            _isEarlyCheckout = isEarlyCheckout; // Mark if it was early checkout
+            isDayCompleted = true; // Mark day as complete - no more actions allowed
+            canClockOut = false;
+            
+            debugPrint('📋 Clock out completed at ${DateFormat('HH:mm').format(clockingMoment)} - Early checkout: $isEarlyCheckout');
+          }
+        });
+
+        // Start/stop timer and animation outside of setState
+        if (action == 'CLOCK IN') {
+          _startWorkTimer();
+          _pulseController.repeat(reverse: true);
+          // Start 2-minute cooldown before enabling clock out
+          _startCooldownTimer();
+        } else {
+          _stopWorkTimer();
+          _pulseController.stop();
+          _pulseController.reset();
+          // No cooldown needed for clock out - day is complete
+        }
+
+        // Save current clocking state to SharedPreferences
+        await _saveClockingState();
+        
+        // Save last clocking data to SharedPreferences (legacy format)
+        await _saveLastClockingData(action, clockingMoment, location);
+
+        // Clean up successful attempt record (keep storage clean)
+        await prefs.remove(attemptKey);
+
+        // Show motivational notifications (don't let notification errors affect clocking)
+        try {
+          if (action == 'CLOCK IN') {
+            await NotificationService.showClockInNotification();
+          } else {
+            await NotificationService.showClockOutNotification();
+          }
+        } catch (e) {
+          debugPrint('⚠️ Notification error (clocking still successful): $e');
+        }
+
+        // Show success popup dialog
+        final timeFormat = DateFormat('HH:mm:ss');
+        if (mounted) {
+          _showClockingSuccessPopup(action, timeFormat.format(currentTime), location);
+        }
+        
+        debugPrint('🎉 Clocking $action completed successfully (opId: $operationId)');
+      } else {
+        // API call failed - clean up attempt record
+        await prefs.remove(attemptKey);
+        
+        debugPrint('❌ API failed for $action (opId: $operationId): ${apiResponse['error']}');
+        
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  const Icon(Icons.error, color: Colors.white, size: 20),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'Failed to ${action == 'CLOCK IN' ? 'PUNCH IN' : 'PUNCH OUT'}: ${apiResponse['error'] ?? 'Unknown error'}',
+                    ),
+                  ),
+                ],
+              ),
+              backgroundColor: Colors.red,
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+              duration: const Duration(seconds: 4),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      // Network or other error - clean up attempt record
+      final prefs = await SharedPreferences.getInstance();
+      final attemptKey = 'punch_attempt_${operationId}';
+      await prefs.remove(attemptKey);
+      
+      debugPrint('❌ Clocking error for $action (opId: $operationId): $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Row(
+              children: [
+                const Icon(Icons.error, color: Colors.white, size: 20),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'Network error: Unable to ${action == 'CLOCK IN' ? 'PUNCH IN' : 'PUNCH OUT'}. Please check your connection.',
+                  ),
+                ),
+              ],
+            ),
+            backgroundColor: Colors.red,
+            behavior: SnackBarBehavior.floating,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    }
+  }
+
+  void _showClockingSuccessPopup(String action, String timeStr, String location) {
+    final isClockIn = action == 'CLOCK IN';
+    final color = isClockIn ? const Color(0xFF2E7D32) : const Color(0xFFC62828);
+    final bgColor = isClockIn ? const Color(0xFFE8F5E9) : const Color(0xFFFFEBEE);
+    final icon = isClockIn ? Icons.login_rounded : Icons.logout_rounded;
+    final title = isClockIn ? 'Punched In Successfully' : 'Punched Out Successfully';
+    final subtitle = isClockIn ? 'Have a great day at work!' : 'Great work today! See you tomorrow.';
+
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        elevation: 0,
+        backgroundColor: Colors.transparent,
+        child: Container(
+          padding: const EdgeInsets.all(24),
+          decoration: BoxDecoration(
+            color: Theme.of(context).cardColor,
+            borderRadius: BorderRadius.circular(20),
+            boxShadow: [
+              BoxShadow(
+                color: color.withValues(alpha: 0.2),
+                blurRadius: 20,
+                spreadRadius: 2,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Icon circle
+              Container(
+                width: 72,
+                height: 72,
+                decoration: BoxDecoration(
+                  color: bgColor,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: color, size: 36),
+              ),
+              const SizedBox(height: 16),
+
+              // Title
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: color,
+                ),
+              ),
+              const SizedBox(height: 8),
+
+              // Subtitle
+              Text(
+                subtitle,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Colors.grey[600],
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Time chip
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                  color: bgColor,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.access_time, size: 16, color: color),
+                    const SizedBox(width: 6),
+                    Text(
+                      timeStr,
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: color,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 8),
+
+              // Location
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.location_on, size: 14, color: Colors.grey[500]),
+                    const SizedBox(width: 4),
+                    Flexible(
+                      child: Text(
+                        location,
+                        textAlign: TextAlign.center,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.grey[500],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 20),
+
+              // Close button
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: color,
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                  child: const Text(
+                    'OK',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    // Also show a quick snackbar for subtle confirmation
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(icon, color: Colors.white, size: 18),
+            const SizedBox(width: 10),
+            Text(
+              '${isClockIn ? 'Punch In' : 'Punch Out'} recorded at $timeStr',
+              style: const TextStyle(fontSize: 13),
+            ),
+          ],
+        ),
+        backgroundColor: color,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        duration: const Duration(seconds: 3),
+        margin: const EdgeInsets.all(12),
+      ),
+    );
+  }
+
+  Future<void> _saveLastClockingData(String action, DateTime time, String? location) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('last_clocking_time', time.toIso8601String());
+      await prefs.setString('last_clocking_location', location ?? 'Location not available');
+      await prefs.setString('last_clocking_type', action == 'CLOCK IN' ? 'CLOCKED-IN' : 'CLOCKED-OUT');
+    } catch (e) {
+      // Handle error silently
+      debugPrint('Error saving clocking data: $e');
+    }
+  }
+
+  /// Get appropriate status text based on current state and business rules
+  String _getStatusText() {
+    if (_hasEverClockedOut && isDayCompleted) {
+      if (_isEarlyCheckout) {
+        return 'Clocked Out Early - Buttons Disabled';
+      } else {
+        return 'Day Complete - Clocked Out';
+      }
+    }
+    
+    if (isCheckedIn) {
+      if (_cooldownSecondsLeft > 0) {
+        return 'Clocked In - Wait ${_formatCooldownTime()}';
+      } else if (!canClockOut) {
+        return 'Clocked In - Clock Out Available';
+      } else {
+        return 'Clocked In - Ready to Clock Out';
+      }
+    }
+    
+    return 'Ready to Clock In';
+  }
+
+  /// Get appropriate status text color
+  Color _getStatusColor() {
+    if (_hasEverClockedOut && isDayCompleted) {
+      if (_isEarlyCheckout) {
+        return Colors.orange[700]!; // Different color for early checkout
+      } else {
+        return Colors.grey[600]!;
+      }
+    }
+    
+    if (_cooldownSecondsLeft > 0) {
+      return Colors.orange[700]!;
+    }
+    
+    if (isCheckedIn) {
+      return Colors.green;
+    }
+    
+    return Theme.of(context).textTheme.bodyMedium?.color ?? Colors.black87;
+  }
+
+  /// Get appropriate button text
+  String _getButtonText() {
+    if (_hasEverClockedOut && isDayCompleted) {
+      if (_isEarlyCheckout) {
+        return 'DISABLED - EARLY CHECKOUT';
+      } else {
+        return 'DAY COMPLETE';
+      }
+    }
+    
+    if (isCheckedIn) {
+      if (_cooldownSecondsLeft > 0) {
+        return 'WAIT ${_formatCooldownTime()}';
+      } else {
+        return 'PUNCH OUT';
+      }
+    }
+    
+    return 'PUNCH IN';
+  }
+
+  /// Get appropriate button text color
+  Color _getButtonTextColor() {
+    if (_hasEverClockedOut && isDayCompleted) {
+      return Colors.grey[600]!;
+    }
+    
+    if (_cooldownSecondsLeft > 0) {
+      return Colors.grey[600]!;
+    }
+    
+    return Colors.white;
+  }
+
+  /// Get appropriate button icon based on state
+  IconData _getButtonIcon() {
+    if (_hasEverClockedOut && isDayCompleted) {
+      if (_isEarlyCheckout) {
+        return Icons.block; // Block icon for early checkout
+      } else {
+        return Icons.check_circle; // Success icon for normal completion
+      }
+    }
+    
+    if (_cooldownSecondsLeft > 0) {
+      return Icons.hourglass_top;
+    }
+    
+    if (isCheckedIn) {
+      return Icons.logout;
+    }
+    
+    return Icons.login;
+  }
+
+  /// Get appropriate button gradient colors based on state
+  List<Color> _getButtonGradientColors() {
+    // Disabled states - grey colors
+    if (_shouldDisableButton()) {
+      return [Colors.grey[300]!, Colors.grey[400]!];
+    }
+    
+    // Active clock out (can clock out) - red colors
+    if (isCheckedIn && canClockOut) {
+      return [Colors.red[400]!, Colors.red[600]!];
+    }
+    
+    // Clock in state or disabled clock out - orange colors  
+    return [const Color(0xFFD2691E), const Color(0xFF8B4513)];
+  }
+
+  /// Check if button should be disabled based on current state and business rules
+  bool _shouldDisableButton() {
+    // Always disable if processing
+    if (_isProcessingClocking || _currentOperationId != null) {
+      return true;
+    }
+    
+    // Disable if user has already clocked out (day complete)
+    if (_hasEverClockedOut && isDayCompleted) {
+      return true;
+    }
+    
+    // Disable clock out during cooldown period (first 2 minutes after clock in)
+    if (isCheckedIn && _cooldownSecondsLeft > 0) {
+      return true;
+    }
+    
+    // Disable clock out if minimum work duration not met (after cooldown)
+    if (isCheckedIn && _cooldownSecondsLeft == 0 && !canClockOut) {
+      return true;
+    }
+    
+    return false;
+  }
+
+  /// Format cooldown time as MM:SS
+  String _formatCooldownTime() {
+    final minutes = _cooldownSecondsLeft ~/ 60;
+    final seconds = _cooldownSecondsLeft % 60;
+    return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  Widget _buildActivityItem(
+    String title,
+    String time,
+    String location,
+    String? coordinates,
+    IconData icon,
+    Color color,
+  ) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.05),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: color.withValues(alpha: 0.2),
+        ),
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Icon(
+              icon,
+              color: color,
+              size: 16,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: color,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      time,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: Colors.black87,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  location,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Colors.grey[600],
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                if (coordinates != null) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    coordinates,
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: Colors.grey[500],
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
